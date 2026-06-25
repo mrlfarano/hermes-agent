@@ -799,6 +799,44 @@ class TestCmdUpdateCheckBranchFlag:
         rev_list_cmds = [c for c in commands if "rev-list" in c]
         assert any("upstream/main" in c for c in rev_list_cmds), rev_list_cmds
 
+    @patch("hermes_cli.config.detect_install_method", return_value="git")
+    @patch("hermes_cli.config.load_config", return_value={"updates": {"branch": "patch/fix"}})
+    @patch("subprocess.run")
+    def test_check_uses_configured_update_branch_without_flag(
+        self, mock_run, _mock_load_config, _mock_method, capsys
+    ):
+        """updates.branch drives check/apply defaults when --branch is absent."""
+        mock_run.side_effect = self._check_side_effect(
+            target_branch="patch/fix", verify_ok=True, commit_count="2"
+        )
+        args = SimpleNamespace(check=True, branch=None)
+
+        cmd_update(args)
+
+        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
+        assert any("fetch" in c and "origin" in c and "patch/fix" in c for c in commands), commands
+        assert not any("fetch" in c and "upstream" in c for c in commands), commands
+        rev_list_cmds = [c for c in commands if "rev-list" in c]
+        assert any("origin/patch/fix" in c for c in rev_list_cmds), rev_list_cmds
+
+    @patch("hermes_cli.config.detect_install_method", return_value="git")
+    @patch("hermes_cli.config.load_config", return_value={"updates": {"branch": "patch/fix"}})
+    @patch("subprocess.run")
+    def test_branch_flag_overrides_configured_update_branch(
+        self, mock_run, _mock_load_config, _mock_method, capsys
+    ):
+        mock_run.side_effect = self._check_side_effect(
+            target_branch="release/test", verify_ok=True, commit_count="1"
+        )
+        args = SimpleNamespace(check=True, branch="release/test")
+
+        cmd_update(args)
+
+        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
+        rev_list_cmds = [c for c in commands if "rev-list" in c]
+        assert any("origin/release/test" in c for c in rev_list_cmds), rev_list_cmds
+        assert not any("origin/patch/fix" in c for c in rev_list_cmds), rev_list_cmds
+
     @patch("hermes_cli.config.detect_install_method", return_value="pip")
     @patch("hermes_cli.banner.check_via_pypi", return_value=0)
     @patch("subprocess.run")

@@ -765,9 +765,11 @@ class TestUpdateCheckEndpoint:
             "update_available",
             "can_apply",
             "update_command",
+            "branch",
             "message",
         } <= set(body)
         assert body["install_method"] == "git"
+        assert body["branch"] == "main"
         assert body["behind"] == 5
         assert body["update_available"] is True
         # git/pip installs can apply the update in place from the dashboard.
@@ -783,6 +785,52 @@ class TestUpdateCheckEndpoint:
         body = self.client.get("/api/hermes/update/check").json()
         assert body["behind"] == 0
         assert body["update_available"] is False
+
+    def test_configured_update_branch_is_reported_and_commanded(self, monkeypatch):
+        import hermes_cli.config as cfg
+        import hermes_cli.web_server as ws
+        import hermes_cli.banner as banner
+
+        monkeypatch.setattr(ws, "detect_install_method", lambda *a, **k: "git")
+        monkeypatch.setattr(ws, "configured_update_branch", lambda: "patch/fix")
+        monkeypatch.setattr(cfg, "configured_update_branch", lambda *a, **k: "patch/fix")
+        monkeypatch.setattr(banner, "check_for_updates", lambda: 2)
+
+        body = self.client.get("/api/hermes/update/check").json()
+
+        assert body["branch"] == "patch/fix"
+        assert body["update_command"] == "hermes update --branch patch/fix"
+        assert body["update_available"] is True
+
+    def test_update_apply_uses_configured_update_branch(self, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        ws._ACTION_PROCS.pop("hermes-update", None)
+        spawned = {}
+
+        class FakeProc:
+            pid = 5252
+
+        def fake_spawn_action(subcommand, name):
+            spawned["subcommand"] = subcommand
+            spawned["name"] = name
+            return FakeProc()
+
+        monkeypatch.setattr(ws, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr(ws, "detect_install_method", lambda *a, **k: "git")
+        monkeypatch.setattr(ws, "configured_update_branch", lambda: "patch/fix")
+        monkeypatch.setattr(ws, "_spawn_hermes_action", fake_spawn_action)
+
+        r = self.client.post("/api/hermes/update")
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ok"] is True
+        assert body["pid"] == 5252
+        assert spawned == {
+            "subcommand": ["update", "--branch", "patch/fix"],
+            "name": "hermes-update",
+        }
 
     def test_docker_is_not_applyable(self, monkeypatch):
         import hermes_cli.web_server as ws
@@ -840,7 +888,7 @@ class TestUpdateCheckEndpoint:
         monkeypatch.setattr(
             ws,
             "_recent_upstream_commits",
-            lambda n=20: [
+            lambda n=20, branch="main": [
                 {"sha": "abc1234", "summary": "feat: x", "author": "a", "at": 1},
             ],
         )

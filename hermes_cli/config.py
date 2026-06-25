@@ -18,6 +18,7 @@ import logging
 import os
 import platform
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -520,6 +521,9 @@ def recommended_update_command_for_method(method: str) -> str:
         if shutil.which("uv"):
             return "uv pip install --upgrade hermes-agent"
         return "pip install --upgrade hermes-agent"
+    branch = configured_update_branch()
+    if branch != "main":
+        return f"hermes update --branch {shlex.quote(branch)}"
     return "hermes update"
 
 
@@ -530,6 +534,28 @@ def recommended_update_command() -> str:
         return managed_cmd
     method = detect_install_method()
     return recommended_update_command_for_method(method)
+
+
+def configured_update_branch(config: Optional[Dict[str, Any]] = None) -> str:
+    """Return the configured branch used by ``hermes update``.
+
+    ``main`` remains the default. Forked installs that carry a local patch
+    branch can set ``updates.branch`` so chat, dashboard, and desktop update
+    flows keep updating that branch instead of silently switching back to
+    upstream main.
+    """
+    if config is None:
+        try:
+            config = load_config()
+        except Exception:
+            config = {}
+    updates = config.get("updates") if isinstance(config, dict) else None
+    branch = updates.get("branch") if isinstance(updates, dict) else None
+    if isinstance(branch, str):
+        branch = branch.strip()
+        if branch:
+            return branch
+    return "main"
 
 
 # Long-form text for ``hermes update`` / ``--check`` when running inside the
@@ -2959,6 +2985,10 @@ DEFAULT_CONFIG = {
 
     # ``hermes update`` behaviour.
     "updates": {
+        # Branch used by ``hermes update`` when --branch is not supplied.
+        # Forked installs that carry local patches can point this at a branch
+        # in their fork; automation can keep that branch rebased on upstream.
+        "branch": "main",
         # Run a full ``hermes backup``-style zip of HERMES_HOME before every
         # ``hermes update``.  Backups land in ``<HERMES_HOME>/backups/`` and
         # can be restored with ``hermes import <path>``.  Off by default:

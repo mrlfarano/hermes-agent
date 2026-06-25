@@ -423,6 +423,7 @@ export const FIELD_LABELS: Record<string, string> = defineFieldCopy({
     reasoningEffort: 'Subagent Reasoning Effort'
   },
   updates: {
+    branch: 'Update Branch',
     nonInteractiveLocalChanges: 'In-App Update Local Changes'
   }
 })
@@ -493,6 +494,8 @@ export const FIELD_DESCRIPTIONS: Record<string, string> = defineFieldCopy({
     }
   },
   updates: {
+    branch:
+      'Branch used by Hermes self-update when no --branch flag is supplied. Use this for fork patch branches that are rebased onto upstream.',
     nonInteractiveLocalChanges:
       'When Hermes updates itself from the app (no terminal prompt), keep local source edits (stash) or throw them away (discard). Terminal updates always ask.'
   }
@@ -630,6 +633,7 @@ export const SECTIONS: DesktopConfigSection[] = [
       'delegation.max_concurrent_children',
       'delegation.child_timeout_seconds',
       'delegation.reasoning_effort',
+      'updates.branch',
       'updates.non_interactive_local_changes'
     ]
   }

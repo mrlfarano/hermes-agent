@@ -231,6 +231,7 @@ export function useStatusbarItems({
     const backendVersion = statusSnapshot?.version
     const behind = backendUpdateStatus?.behind ?? 0
     const updateAvailable = backendUpdateStatus?.updateAvailable || behind > 0
+    const branch = backendUpdateStatus?.branch ?? 'main'
     const applying = backendUpdateApply.applying || backendUpdateApply.stage === 'restart'
 
     const base = copy.backendLabel(backendVersion ?? copy.unknown)
@@ -244,7 +245,7 @@ export function useStatusbarItems({
 
     const tooltip = [
       applying ? backendUpdateApply.message || copy.updateInProgress : null,
-      !applying && behind > 0 && copy.commitsBehind(behind, 'main'),
+      !applying && behind > 0 && copy.commitsBehind(behind, branch),
       !applying && behind <= 0 && updateAvailable && copy.update,
       backendVersion && copy.backendVersion(backendVersion)
     ]
@@ -269,6 +270,7 @@ export function useStatusbarItems({
     backendUpdateApply.applying,
     backendUpdateApply.message,
     backendUpdateApply.stage,
+    backendUpdateStatus?.branch,
     copy
   ])
 

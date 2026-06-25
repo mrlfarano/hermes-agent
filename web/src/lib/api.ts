@@ -1547,6 +1547,7 @@ export interface UpdateCheckResponse {
   update_available: boolean;
   can_apply: boolean;
   update_command: string;
+  branch?: string;
   message: string | null;
 }
 

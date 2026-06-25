@@ -196,6 +196,7 @@ describe('checkBackendUpdates', () => {
       update_available: true,
       can_apply: true,
       update_command: 'hermes update',
+      branch: 'patch/fix',
       message: null,
       commits: [{ sha: 'abc1234', summary: 'feat: x', author: 'a', at: 1 }]
     })
@@ -205,6 +206,7 @@ describe('checkBackendUpdates', () => {
     expect(checkHermesUpdateSpy).toHaveBeenCalled()
     expect(result?.behind).toBe(2)
     expect(result?.updateAvailable).toBe(true)
+    expect(result?.branch).toBe('patch/fix')
     expect(result?.commits?.[0]?.sha).toBe('abc1234')
     expect(result?.supported).toBe(true)
     expect($backendUpdateStatus.get()?.commits?.[0]?.summary).toBe('feat: x')

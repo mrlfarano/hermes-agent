@@ -56,6 +56,7 @@ const {
 } = require('./titlebar-overlay-width.cjs')
 const { readDirForIpc } = require('./fs-read-dir.cjs')
 const { readLiveUpdateMarker } = require('./update-marker.cjs')
+const { readUpdateBranchFromHermesConfigText } = require('./update-branch-config.cjs')
 const {
   resolveUnpackedRelease,
   decideRelaunchOutcome,
@@ -1772,7 +1773,14 @@ function readDesktopUpdateConfig() {
     const branch = typeof parsed?.branch === 'string' ? parsed.branch.trim() : ''
     return { branch: branch || DEFAULT_UPDATE_BRANCH }
   } catch {
-    return { branch: DEFAULT_UPDATE_BRANCH }
+    try {
+      const raw = fs.readFileSync(path.join(HERMES_HOME, 'config.yaml'), 'utf8')
+      return {
+        branch: readUpdateBranchFromHermesConfigText(raw, DEFAULT_UPDATE_BRANCH)
+      }
+    } catch {
+      return { branch: DEFAULT_UPDATE_BRANCH }
+    }
   }
 }
 

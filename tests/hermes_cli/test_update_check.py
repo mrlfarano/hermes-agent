@@ -27,7 +27,7 @@ def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
     (repo_dir / ".git").mkdir()
 
     cache_file = tmp_path / ".update_check"
-    cache_file.write_text(json.dumps({"ts": time.time(), "behind": 3, "ver": __version__}))
+    cache_file.write_text(json.dumps({"ts": time.time(), "behind": 3, "ver": __version__, "branch": "main"}))
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     with patch("hermes_cli.banner.subprocess.run") as mock_run:
@@ -35,6 +35,55 @@ def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
 
     assert result == 3
     mock_run.assert_not_called()
+
+
+def test_check_for_updates_invalidates_on_branch_change(tmp_path, monkeypatch):
+    """A fresh cache for another update branch must not be reused."""
+    import hermes_cli.banner as banner
+
+    repo_dir = tmp_path / "hermes-agent"
+    repo_dir.mkdir()
+    (repo_dir / ".git").mkdir()
+
+    cache_file = tmp_path / ".update_check"
+    cache_file.write_text(
+        json.dumps({"ts": time.time(), "behind": 9, "ver": banner.VERSION, "branch": "main"})
+    )
+
+    fake_banner = repo_dir / "hermes_cli" / "banner.py"
+    fake_banner.parent.mkdir(parents=True, exist_ok=True)
+    fake_banner.touch()
+    monkeypatch.setattr(banner, "__file__", str(fake_banner))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"updates": {"branch": "patch/fix"}},
+    )
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd == ["git", "remote", "get-url", "origin"]:
+            return MagicMock(returncode=0, stdout="https://github.com/example/hermes-agent.git\n")
+        if cmd == ["git", "rev-parse", "--is-shallow-repository"]:
+            return MagicMock(returncode=0, stdout="false\n")
+        if cmd[:2] == ["git", "fetch"]:
+            return MagicMock(returncode=0, stdout="")
+        if cmd == ["git", "rev-list", "--count", "HEAD..origin/patch/fix"]:
+            return MagicMock(returncode=0, stdout="1\n")
+        raise AssertionError(f"unexpected git command: {cmd!r}")
+
+    with patch("hermes_cli.banner.subprocess.run", side_effect=fake_run):
+        result = banner.check_for_updates()
+
+    assert result == 1
+    assert [
+        "git", "fetch", "--quiet", "origin",
+        "refs/heads/patch/fix:refs/remotes/origin/patch/fix",
+    ] in calls
+    written = json.loads(cache_file.read_text())
+    assert written["branch"] == "patch/fix"
 
 
 def test_check_for_updates_invalidates_on_version_change(tmp_path, monkeypatch):
@@ -126,7 +175,10 @@ def test_check_for_updates_official_ssh_origin_uses_https_probe(tmp_path):
         result = banner._check_via_local_git(repo_dir)
 
     assert result == 1
-    assert ["git", "fetch", "origin", "--quiet"] not in calls
+    assert [
+        "git", "fetch", "--quiet", "origin",
+        "refs/heads/main:refs/remotes/origin/main",
+    ] not in calls
 
 
 def test_check_via_local_git_shallow_clone_behind_reports_no_count(tmp_path):
@@ -167,7 +219,10 @@ def test_check_via_local_git_shallow_clone_behind_reports_no_count(tmp_path):
 
     assert result == banner.UPDATE_AVAILABLE_NO_COUNT
     # The shallow fetch must preserve the boundary (--depth 1), not unshallow.
-    assert ["git", "fetch", "origin", "--depth", "1", "--quiet"] in calls
+    assert [
+        "git", "fetch", "--depth", "1", "--quiet", "origin",
+        "refs/heads/main:refs/remotes/origin/main",
+    ] in calls
 
 
 def test_check_via_local_git_shallow_clone_up_to_date(tmp_path):

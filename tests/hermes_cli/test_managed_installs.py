@@ -39,6 +39,15 @@ def test_recommended_update_command_defaults_to_hermes_update(monkeypatch):
         assert recommended_update_command() == "hermes update"
 
 
+def test_recommended_update_command_includes_configured_branch(monkeypatch):
+    monkeypatch.delenv("HERMES_MANAGED", raising=False)
+
+    with patch("hermes_cli.config.get_managed_update_command", return_value=None), \
+         patch("hermes_cli.config.detect_install_method", return_value="git"), \
+         patch("hermes_cli.config.load_config", return_value={"updates": {"branch": "patch/fix"}}):
+        assert recommended_update_command() == "hermes update --branch patch/fix"
+
+
 def test_cmd_update_blocks_managed_homebrew(monkeypatch, capsys):
     monkeypatch.setenv("HERMES_MANAGED", "homebrew")
 

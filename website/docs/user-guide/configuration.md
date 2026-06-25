@@ -97,10 +97,13 @@ Leaving these unset keeps the legacy defaults (`HERMES_API_TIMEOUT=1800`s, `HERM
 
 ```yaml
 updates:
+  branch: main                   # Default branch for hermes update
   pre_update_backup: false       # Create a full HERMES_HOME zip before every update
   backup_keep: 5                 # Keep this many pre-update backup zips
   non_interactive_local_changes: stash  # stash | discard
 ```
+
+For forked installs that carry local patches, set `updates.branch` to a branch in your fork and keep that branch rebased onto upstream. Hermes update checks and apply flows then use that branch unless a command supplies `--branch` explicitly.
 
 For git installs, Hermes auto-stashes dirty tracked files and untracked files before checking out the update branch or pulling. Interactive terminal updates prompt before restoring that stash. Non-interactive updates (desktop/chat app, gateway, or `--yes`) use `updates.non_interactive_local_changes`: `stash` restores local source edits after a successful pull, while `discard` drops the update-created stash after a successful pull. Use `discard` only on managed installs where local source edits are never meant to persist.
 

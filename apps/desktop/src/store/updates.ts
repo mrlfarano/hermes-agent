@@ -249,6 +249,7 @@ function mapBackendCheck(res: BackendUpdateCheckResponse): DesktopUpdateStatus {
 
   return {
     supported: res.can_apply,
+    branch: res.branch ?? undefined,
     message: res.message ?? undefined,
     updateAvailable: res.update_available,
     behind: behind > 0 ? behind : 0,

@@ -834,6 +834,7 @@ export interface BackendUpdateCheckResponse {
   update_available: boolean
   can_apply: boolean
   update_command: string | null
+  branch?: string
   message: string | null
   commits?: BackendUpdateCommit[]
 }

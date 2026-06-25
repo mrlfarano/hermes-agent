@@ -66,6 +66,7 @@ from hermes_cli.config import (
     save_env_value,
     remove_env_value,
     check_config_version,
+    configured_update_branch,
     detect_install_method,
     format_docker_update_message,
     recommended_update_command_for_method,
@@ -697,6 +698,13 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "type": "select",
         "description": "Reasoning effort for delegated subagents",
         "options": ["", "low", "medium", "high"],
+    },
+    "updates.branch": {
+        "type": "string",
+        "description": (
+            "Branch used by Hermes self-update when --branch is not supplied. "
+            "Use this for fork patch branches that are rebased onto upstream."
+        ),
     },
     "updates.non_interactive_local_changes": {
         "type": "select",
@@ -3157,8 +3165,13 @@ async def update_hermes():
             "update_command": recommended_update_command_for_method(install_method),
         }
 
+    update_args = ["update"]
+    branch = configured_update_branch()
+    if branch != "main":
+        update_args.extend(["--branch", branch])
+
     try:
-        proc = _spawn_hermes_action(["update"], "hermes-update")
+        proc = _spawn_hermes_action(update_args, "hermes-update")
     except Exception as exc:
         _log.exception("Failed to spawn hermes update")
         raise HTTPException(status_code=500, detail=f"Failed to start update: {exc}")
@@ -3169,10 +3182,10 @@ async def update_hermes():
     }
 
 
-def _recent_upstream_commits(n: int = 20) -> List[Dict[str, Any]]:
-    """Commits the local checkout is behind ``origin/main`` by, newest first.
+def _recent_upstream_commits(n: int = 20, branch: str = "main") -> List[Dict[str, Any]]:
+    """Commits the local checkout is behind ``origin/<branch>`` by, newest first.
 
-    Logs the SAME range the behind-count uses (``HEAD..origin/main`` — see
+    Logs the SAME range the behind-count uses (``HEAD..origin/<branch>`` — see
     ``banner._check_via_local_git``), NOT the branch's ``@{upstream}``. On a
     feature-branch checkout ``@{upstream}`` is the branch's own tip (zero
     commits), which would leave the changelog empty even though the count is
@@ -3189,7 +3202,7 @@ def _recent_upstream_commits(n: int = 20) -> List[Dict[str, Any]]:
                 str(PROJECT_ROOT),
                 "log",
                 "--format=%H%x1f%s%x1f%an%x1f%ct",
-                "HEAD..origin/main",
+                f"HEAD..origin/{branch}",
                 f"-n{int(n)}",
             ],
             capture_output=True,
@@ -3258,6 +3271,7 @@ async def check_hermes_update(force: bool = False):
         }
 
     install_method = detect_install_method(PROJECT_ROOT)
+    update_branch = configured_update_branch()
     update_command = recommended_update_command_for_method(install_method)
 
     payload: Dict[str, Any] = {
@@ -3267,6 +3281,7 @@ async def check_hermes_update(force: bool = False):
         "update_available": False,
         "can_apply": install_method in ("git", "pip"),
         "update_command": update_command,
+        "branch": update_branch,
         "message": None,
     }
 
@@ -3302,7 +3317,10 @@ async def check_hermes_update(force: bool = False):
         # remote update overlay can show "what's changed". git/pip only;
         # best-effort (empty list on any failure).
         if install_method in ("git", "pip"):
-            payload["commits"] = await asyncio.to_thread(_recent_upstream_commits)
+            payload["commits"] = await asyncio.to_thread(
+                _recent_upstream_commits,
+                branch=update_branch,
+            )
 
     return payload
 

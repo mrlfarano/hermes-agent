@@ -8358,12 +8358,17 @@ def _finalize_update_output(state):
 def _resolve_update_branch(args) -> str:
     """Normalize ``args.branch`` into a non-empty branch name.
 
-    Centralizes the "default to main, accept --branch override, treat empty
-    or whitespace-only values as the default" parsing so every consumer of
-    ``--branch`` (check path, git-update path, ZIP-fallback path) agrees on
-    the same answer.
+    Centralizes the "default to configured branch, accept --branch override,
+    treat empty or whitespace-only values as the default" parsing so every
+    consumer of ``--branch`` (check path, git-update path, ZIP-fallback path)
+    agrees on the same answer.
     """
-    return (getattr(args, "branch", None) or "main").strip() or "main"
+    explicit = getattr(args, "branch", None)
+    if explicit is not None and str(explicit).strip():
+        return str(explicit).strip()
+    from hermes_cli.config import configured_update_branch
+
+    return configured_update_branch()
 
 
 def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
