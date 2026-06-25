@@ -38,6 +38,15 @@ def _init_git_repo(repo: Path) -> None:
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True, text=True)
 
 
+def _write_test_skill(skills_root: Path, name: str) -> None:
+    skill_dir = skills_root / name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    skill_dir.joinpath("SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: test skill\n---\n\n# {name}\n",
+        encoding="utf-8",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Schema / init
 # ---------------------------------------------------------------------------
@@ -981,6 +990,51 @@ def test_real_crash_still_counts_and_trips_breaker(kanban_home, monkeypatch):
         )
 
 
+def test_crash_error_includes_worker_log_excerpt(kanban_home, monkeypatch):
+    """Startup crashes should surface the actionable worker-log cause."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(_kb, "_resolve_crash_grace_seconds", lambda: 0)
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="crash with log", assignee="a")
+        claimed = kb.claim_task(conn, tid, claimer=f"{host}:worker")
+        assert claimed is not None
+        pid = 61000
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, started_at=? WHERE id=?",
+            (pid, int(time.time()) - 10, tid),
+        )
+        conn.execute(
+            "UPDATE task_runs SET worker_pid=? WHERE id=?",
+            (pid, claimed.current_run_id),
+        )
+        conn.commit()
+        log_path = kb.worker_log_path(tid)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(
+            "Warning: Unknown toolsets: messaging\n"
+            "Error: Unknown skill(s): test-driven-development\n",
+            encoding="utf-8",
+        )
+
+        _kb._record_worker_exit(pid, _exited_status(1))
+        crashed = kb.detect_crashed_workers(conn)
+
+        task = kb.get_task(conn, tid)
+        runs = kb.list_runs(conn, tid)
+        events = kb.list_events(conn, tid)
+
+    assert crashed == [tid]
+    assert "worker log: Warning: Unknown toolsets: messaging" in task.last_failure_error
+    assert "Error: Unknown skill(s): test-driven-development" in task.last_failure_error
+    assert "Unknown skill(s): test-driven-development" in runs[0].error
+    crashed_event = [event for event in events if event.kind == "crashed"][-1]
+    assert "Unknown skill(s): test-driven-development" in crashed_event.payload["log_excerpt"]
+
+
 def test_respawn_guard_defers_rate_limited_within_cooldown(
     kanban_home, monkeypatch,
 ):
@@ -1740,6 +1794,97 @@ def test_dispatch_spawn_failure_releases_claim(kanban_home, all_assignees_spawna
         # Must return to ready so the next tick can retry.
         assert kb.get_task(conn, t).status == "ready"
         assert kb.get_task(conn, t).claim_lock is None
+
+
+def test_dispatch_blocks_missing_forced_skill_before_spawn(kanban_home):
+    """A missing --skills preload is deterministic and should not spawn."""
+    _write_test_skill(kanban_home / "skills", "some-other-skill")
+    spawn_calls = []
+
+    def fake_spawn(task, workspace):
+        spawn_calls.append(task.id)
+        return 42
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="missing skill",
+            assignee="default",
+            skills=["missing-skill"],
+            max_retries=5,
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+        task = kb.get_task(conn, t)
+        events = kb.list_events(conn, t)
+        run = kb.list_runs(conn, t)[0]
+
+    assert spawn_calls == []
+    assert res.auto_blocked == [t]
+    assert task.status == "blocked"
+    assert task.consecutive_failures == 1
+    assert "missing forced skill(s): missing-skill" in task.last_failure_error
+    assert run.outcome == "gave_up"
+    gave_up = [event for event in events if event.kind == "gave_up"][-1]
+    assert gave_up.payload["preflight"] == "skills"
+    assert gave_up.payload["profile"] == "default"
+
+
+def test_dispatch_skill_preflight_uses_profile_home_not_root(kanban_home):
+    """A skill installed in the root home must not satisfy another profile."""
+    _write_test_skill(kanban_home / "skills", "test-driven-development")
+    profile_home = kanban_home / "profiles" / "controller"
+    (profile_home / "skills").mkdir(parents=True)
+    profile_home.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+
+    spawn_calls = []
+
+    def fake_spawn(task, workspace):
+        spawn_calls.append(task.id)
+        return 42
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="profile scoped skill",
+            assignee="controller",
+            skills=["test-driven-development"],
+            max_retries=5,
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        task = kb.get_task(conn, t)
+
+    assert spawn_calls == []
+    assert res.auto_blocked == [t]
+    assert task.status == "blocked"
+    assert "profile 'controller'" in task.last_failure_error
+    assert "missing forced skill(s): test-driven-development" in task.last_failure_error
+
+
+def test_dispatch_allows_profile_visible_forced_skill(kanban_home):
+    profile_home = kanban_home / "profiles" / "controller"
+    _write_test_skill(profile_home / "skills", "test-driven-development")
+    profile_home.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+
+    spawn_calls = []
+
+    def fake_spawn(task, workspace):
+        spawn_calls.append((task.id, list(task.skills or [])))
+        return 42
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="profile has skill",
+            assignee="controller",
+            skills=["test-driven-development"],
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        task = kb.get_task(conn, t)
+
+    assert spawn_calls == [(t, ["test-driven-development"])]
+    assert res.spawned[0][0] == t
+    assert task.status == "running"
 
 
 def test_dispatch_max_spawn_counts_existing_running_tasks(

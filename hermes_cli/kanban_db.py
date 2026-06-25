@@ -86,7 +86,7 @@ import logging
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterable, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
@@ -6343,6 +6343,335 @@ def _error_fingerprint(error_text: str) -> str:
     return fp.lower().strip()
 
 
+def _skill_identifier_lookup_error(name: str) -> Optional[str]:
+    """Return a validation error for a force-loaded skill identifier.
+
+    Mirrors the local path-safety checks in ``tools.skills_tool.skill_view``
+    without importing that module, whose module-level ``SKILLS_DIR`` may be
+    bound to the dispatcher's home rather than the worker profile's home.
+    """
+    if not isinstance(name, str):
+        return "skill name must be a string"
+    candidate = name.strip()
+    if not candidate:
+        return "skill name is empty"
+    if (
+        PurePosixPath(candidate).is_absolute()
+        or PureWindowsPath(candidate).is_absolute()
+        or PureWindowsPath(candidate).drive
+    ):
+        return "skill name must be relative to the skills directory"
+    parts = PurePosixPath(candidate.replace("\\", "/")).parts
+    if ".." in parts:
+        return "skill name cannot contain '..' path traversal components"
+    return None
+
+
+def _profile_skill_search_dirs(profile_home: str) -> list[Path]:
+    """Return the skill roots visible to a worker profile."""
+    roots: list[Path] = []
+    local = Path(profile_home) / "skills"
+    if local.exists():
+        roots.append(local)
+    try:
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from agent.skill_utils import get_external_skills_dirs
+
+        token = set_hermes_home_override(profile_home)
+        try:
+            roots.extend(get_external_skills_dirs())
+        finally:
+            reset_hermes_home_override(token)
+    except Exception:
+        pass
+
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for root in roots:
+        try:
+            key = root.resolve()
+        except Exception:
+            key = root
+        if key in seen:
+            continue
+        seen.add(key)
+        if root.exists():
+            deduped.append(root)
+    return deduped
+
+
+def _find_profile_skill_candidate(
+    name: str,
+    search_dirs: list[Path],
+) -> tuple[Optional[Path], list[Path], Optional[str]]:
+    """Find a force-loaded skill by the same local strategies as skill_view.
+
+    Returns ``(skill_md_path, all_matches, error)``. ``skill_md_path`` is
+    ``None`` when missing or ambiguous.
+    """
+    lookup_error = _skill_identifier_lookup_error(name)
+    if lookup_error:
+        return None, [], lookup_error
+
+    try:
+        from agent.skill_utils import (
+            is_skill_support_path,
+            iter_skill_index_files,
+            parse_frontmatter,
+        )
+    except Exception as exc:
+        return None, [], f"could not load skill scanner: {exc}"
+
+    local_category_name: Optional[str] = None
+    if ":" in name:
+        namespace, bare = name.split(":", 1)
+        if namespace and bare:
+            local_category_name = f"{namespace}/{bare}"
+
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+
+    def _record(path: Path) -> None:
+        try:
+            key = path.resolve()
+        except Exception:
+            key = path
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(path)
+
+    for search_dir in search_dirs:
+        direct_path = search_dir / name
+        if (
+            not is_skill_support_path(direct_path)
+            and direct_path.is_dir()
+            and (direct_path / "SKILL.md").exists()
+        ):
+            _record(direct_path / "SKILL.md")
+        else:
+            direct_md = direct_path.with_suffix(".md")
+            if direct_md.exists() and not is_skill_support_path(direct_md):
+                _record(direct_md)
+
+        if local_category_name:
+            categorized_path = search_dir / local_category_name
+            if (
+                not is_skill_support_path(categorized_path)
+                and categorized_path.is_dir()
+                and (categorized_path / "SKILL.md").exists()
+            ):
+                _record(categorized_path / "SKILL.md")
+            else:
+                categorized_md = categorized_path.with_suffix(".md")
+                if categorized_md.exists() and not is_skill_support_path(categorized_md):
+                    _record(categorized_md)
+
+        for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
+            if found_skill_md.parent.name == name:
+                _record(found_skill_md)
+                continue
+            try:
+                fm_content = found_skill_md.read_text(encoding="utf-8")
+                frontmatter, _ = parse_frontmatter(fm_content)
+            except Exception:
+                frontmatter = {}
+            if frontmatter.get("name") == name:
+                _record(found_skill_md)
+
+        if "/" not in name and "\\" not in name:
+            for found_md in search_dir.rglob(f"{name}.md"):
+                if found_md.name != "SKILL.md" and not is_skill_support_path(found_md):
+                    _record(found_md)
+
+    if len(candidates) > 1:
+        return None, candidates, "ambiguous skill name"
+    if candidates:
+        return candidates[0], candidates, None
+    return None, [], None
+
+
+def _plugin_skill_visible_for_profile(name: str, profile_home: str) -> bool:
+    """Best-effort plugin-skill check for qualified force-load identifiers."""
+    if ":" not in name:
+        return False
+    try:
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from hermes_cli.plugins import discover_plugins, get_plugin_manager
+
+        token = set_hermes_home_override(profile_home)
+        try:
+            discover_plugins()
+            skill_md = get_plugin_manager().find_plugin_skill(name)
+        finally:
+            reset_hermes_home_override(token)
+        return bool(skill_md and skill_md.exists())
+    except Exception:
+        return False
+
+
+def _task_skill_preflight_error(task: Task, profile_name: str) -> Optional[str]:
+    """Return a deterministic worker-start error for invalid forced skills.
+
+    The child CLI rejects unknown ``--skills`` during startup. Doing the same
+    check in the dispatcher keeps a bad card from briefly spawning a worker and
+    then surfacing only "pid exited with code 1" to operators.
+    """
+    skills = [
+        str(skill).strip()
+        for skill in (task.skills or [])
+        if str(skill).strip()
+    ]
+    if not skills:
+        return None
+
+    try:
+        from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+
+        profile_arg = normalize_profile_name(profile_name)
+        profile_home = resolve_profile_env(profile_arg)
+    except FileNotFoundError:
+        # The real profile-exists guard should have handled this. Tests often
+        # monkeypatch profile_exists() for synthetic assignees, so avoid turning
+        # those fake profiles into skill-preflight failures.
+        return None
+    except Exception as exc:
+        return (
+            f"cannot start task: profile {profile_name!r} could not be resolved "
+            f"for forced skill preflight: {exc}"
+        )
+
+    search_dirs = _profile_skill_search_dirs(profile_home)
+    if not search_dirs:
+        missing = [
+            skill for skill in skills
+            if not _plugin_skill_visible_for_profile(skill, profile_home)
+        ]
+        if missing:
+            return (
+                f"cannot start task: profile {profile_arg!r} has no visible "
+                f"skills directory for forced skill(s): {', '.join(missing)}"
+            )
+        return None
+
+    try:
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from agent.skill_utils import (
+            get_disabled_skill_names,
+            parse_frontmatter,
+            skill_matches_platform,
+        )
+
+        token = set_hermes_home_override(profile_home)
+        try:
+            disabled = get_disabled_skill_names()
+        finally:
+            reset_hermes_home_override(token)
+    except Exception:
+        disabled = set()
+        parse_frontmatter = None  # type: ignore[assignment]
+        skill_matches_platform = None  # type: ignore[assignment]
+
+    missing: list[str] = []
+    unsupported: list[str] = []
+    disabled_skills: list[str] = []
+    invalid: list[str] = []
+    ambiguous: list[str] = []
+
+    for skill in skills:
+        if _plugin_skill_visible_for_profile(skill, profile_home):
+            continue
+        skill_md, matches, lookup_error = _find_profile_skill_candidate(
+            skill,
+            search_dirs,
+        )
+        if lookup_error:
+            if matches:
+                ambiguous.append(skill)
+            else:
+                invalid.append(f"{skill} ({lookup_error})")
+            continue
+        if not skill_md:
+            missing.append(skill)
+            continue
+        try:
+            raw = skill_md.read_text(encoding="utf-8")
+        except Exception as exc:
+            invalid.append(f"{skill} (failed to read {skill_md}: {exc})")
+            continue
+        frontmatter = {}
+        if parse_frontmatter is not None:
+            try:
+                frontmatter, _ = parse_frontmatter(raw)
+            except Exception:
+                frontmatter = {}
+        if skill_matches_platform is not None and not skill_matches_platform(frontmatter):
+            unsupported.append(skill)
+            continue
+        resolved_name = str(frontmatter.get("name") or skill_md.parent.name)
+        if resolved_name in disabled:
+            disabled_skills.append(resolved_name)
+
+    problems: list[str] = []
+    if missing:
+        problems.append(f"missing forced skill(s): {', '.join(missing)}")
+    if ambiguous:
+        problems.append(f"ambiguous forced skill(s): {', '.join(ambiguous)}")
+    if unsupported:
+        problems.append(f"platform-unsupported forced skill(s): {', '.join(unsupported)}")
+    if disabled_skills:
+        problems.append(f"disabled forced skill(s): {', '.join(disabled_skills)}")
+    if invalid:
+        problems.append(f"invalid forced skill(s): {', '.join(invalid)}")
+    if not problems:
+        return None
+    return f"cannot start task for profile {profile_arg!r}: " + "; ".join(problems)
+
+
+_CRASH_LOG_INTERESTING_PREFIXES = (
+    "Error:",
+    "Traceback ",
+    "Exception:",
+    "ValueError:",
+    "RuntimeError:",
+    "FileNotFoundError:",
+    "ModuleNotFoundError:",
+)
+
+
+def _worker_crash_log_excerpt(task_id: str) -> Optional[str]:
+    """Return a short actionable excerpt from a crashed worker log."""
+    text = read_worker_log(task_id, tail_bytes=8192)
+    if not text:
+        return None
+    interesting: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if any(line.startswith(prefix) for prefix in _CRASH_LOG_INTERESTING_PREFIXES):
+            interesting.append(line)
+        elif "Unknown skill(s):" in line or "Unknown toolsets:" in line:
+            interesting.append(line)
+        if len(interesting) >= 3:
+            break
+    if not interesting:
+        return None
+    excerpt = " | ".join(interesting)
+    if len(excerpt) > 300:
+        excerpt = excerpt[:297] + "..."
+    return excerpt
+
+
 def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
@@ -6449,11 +6778,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     error_text = f"pid {pid} killed by signal {code}"
                 else:
                     error_text = f"pid {pid} not alive"
+                excerpt = _worker_crash_log_excerpt(row["id"])
+                if excerpt:
+                    error_text = f"{error_text}; worker log: {excerpt}"
                 event_kind = "crashed"
                 event_payload = {"pid": pid, "claimer": row["claim_lock"]}
                 if code is not None and kind != "unknown":
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
+                if excerpt:
+                    event_payload["log_excerpt"] = excerpt
 
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
@@ -6547,6 +6881,7 @@ def _record_task_failure(
     *,
     outcome: str,
     failure_limit: int = None,
+    force_failure_limit: bool = False,
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
@@ -6599,11 +6934,16 @@ def _record_task_failure(
         cur_status = row["status"]
 
         # Per-task override wins over both caller-supplied and default
-        # thresholds. None (the common case) falls through.
+        # thresholds. Deterministic startup preflight failures opt into
+        # ``force_failure_limit`` so a known-bad launch config blocks once
+        # instead of spending the card's retry budget on identical crashes.
         task_override = (
             row["max_retries"] if "max_retries" in row.keys() else None
         )
-        if task_override is not None:
+        if force_failure_limit:
+            effective_limit = int(failure_limit)
+            limit_source = "dispatcher_forced"
+        elif task_override is not None:
             effective_limit = int(task_override)
             limit_source = "task"
         else:
@@ -6702,13 +7042,17 @@ def _record_spawn_failure(
     error: str,
     *,
     failure_limit: int = None,
+    force_failure_limit: bool = False,
+    event_payload_extra: Optional[dict] = None,
 ) -> bool:
     return _record_task_failure(
         conn, task_id, error,
         outcome="spawn_failed",
         failure_limit=failure_limit,
+        force_failure_limit=force_failure_limit,
         release_claim=True,
         end_run=True,
+        event_payload_extra=event_payload_extra,
     )
 
 
@@ -7242,6 +7586,15 @@ def _dispatch_once_locked(
                     )
             continue
         if dry_run:
+            preflight_task = get_task(conn, row["id"])
+            if preflight_task is not None:
+                preflight_error = _task_skill_preflight_error(
+                    preflight_task,
+                    row_assignee,
+                )
+                if preflight_error:
+                    result.respawn_guarded.append((row["id"], preflight_error))
+                    continue
             result.spawned.append((row["id"], row_assignee, ""))
             # Increment per-profile counter even in dry_run so the cap
             # check sees the would-be spawn on subsequent iterations.
@@ -7254,6 +7607,25 @@ def _dispatch_once_locked(
             continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
+            continue
+        preflight_error = _task_skill_preflight_error(
+            claimed,
+            claimed.assignee or row_assignee,
+        )
+        if preflight_error:
+            auto = _record_spawn_failure(
+                conn,
+                claimed.id,
+                preflight_error,
+                failure_limit=1,
+                force_failure_limit=True,
+                event_payload_extra={
+                    "preflight": "skills",
+                    "profile": claimed.assignee or row_assignee,
+                },
+            )
+            if auto:
+                result.auto_blocked.append(claimed.id)
             continue
         try:
             resolved_branch_name = None
@@ -7372,6 +7744,25 @@ def _dispatch_once_locked(
         # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
         # review agent needs.
         claimed.skills = ["sdlc-review"]
+        preflight_error = _task_skill_preflight_error(
+            claimed,
+            claimed.assignee or row["assignee"],
+        )
+        if preflight_error:
+            auto = _record_spawn_failure(
+                conn,
+                claimed.id,
+                preflight_error,
+                failure_limit=1,
+                force_failure_limit=True,
+                event_payload_extra={
+                    "preflight": "skills",
+                    "profile": claimed.assignee or row["assignee"],
+                },
+            )
+            if auto:
+                result.auto_blocked.append(claimed.id)
+            continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect
